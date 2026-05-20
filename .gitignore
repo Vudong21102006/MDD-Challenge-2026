@@ -1,0 +1,25 @@
+# Bỏ qua các file biên dịch của Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bỏ qua môi trường ảo (Virtual Environment)
+venv/
+.venv/
+env/
+
+# Bỏ qua cấu hình của các công cụ code (VS Code, Jupyter)
+.vscode/
+.ipynb_checkpoints/
+
+# Bỏ qua file cấu hình cụ thể
+CLAUDE.MD
+*.csv
+*.wav
+*.mp3
+*.flac
+
+# Bỏ qua các file trong thư mục experiments/
+experiments/*
+!experiments/.gitkeep
