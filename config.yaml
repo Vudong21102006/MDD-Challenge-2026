@@ -1,0 +1,51 @@
+# =============================================================================
+# MDD Challenge — Centralized Configuration
+# =============================================================================
+
+model:
+  # Pretrained Wav2Vec2 model fine-tuned on Vietnamese speech (250h).
+  pretrained_name: "nguyenvulebinh/wav2vec2-base-vietnamese-250h"
+  # Whether to freeze the feature extractor during training.
+  freeze_feature_extractor: true
+  # Attention dropout probability for the transformer layers.
+  attention_dropout: 0.1
+  # Hidden dropout probability for the transformer layers.
+  hidden_dropout: 0.1
+  # Whether to apply a mask to the feature encoder outputs during training.
+  mask_time_prob: 0.05
+  # Length of each time mask (in time steps).
+  mask_time_length: 10
+
+training:
+  # Peak learning rate (AdamW with linear warmup + linear decay).
+  learning_rate: 3.0e-5
+  # Per-device batch size (gradients accumulate over `gradient_accumulation_steps`).
+  batch_size: 8
+  # Number of gradient accumulation steps before each optimizer step.
+  gradient_accumulation_steps: 1
+  # Maximum number of training epochs.
+  epochs: 30
+  # Fraction of total training steps devoted to linear warmup.
+  warmup_ratio: 0.1
+  # Weight decay applied to all parameters except biases and LayerNorm weights.
+  weight_decay: 0.005
+  # Metric used to select the best checkpoint during training.
+  metric_for_best_model: "loss"
+  # Whether to load the best model at the end of training.
+  load_best_model_at_end: true
+  # FP16 mixed-precision training (set false for CPU-only environments).
+  fp16: false
+  # Random seed for reproducibility.
+  seed: 42
+
+data:
+  # Relative paths (from project root).
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  # Sub-directories inside raw_dir.
+  metadata_dir: "data/raw/metadata"
+  audio_dir: "data/raw/audio_data"
+  # Train / validation split ratio.
+  validation_split: 0.1
+  # Maximum audio duration in seconds (samples exceeding this are skipped).
+  max_duration: 30.0
