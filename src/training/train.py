@@ -162,7 +162,8 @@ class MDDTrainer:
 
         # ── Reload best checkpoint ─────────────────────────────────────
         if self.load_best_model_at_end and os.path.exists(self.checkpoint_path):
-            self.model.load_state_dict(torch.load(self.checkpoint_path))
+            checkpoint = torch.load(self.checkpoint_path, weights_only=False)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
             print(
                 f"Loaded best checkpoint with "
                 f"val_loss={self.best_val_loss:.4f}"
