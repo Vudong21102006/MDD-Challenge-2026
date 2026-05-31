@@ -1,5 +1,8 @@
 torch
 torchaudio
+transformers
 soundfile
+numpy
+pandas
 scikit-learn
 pyyaml

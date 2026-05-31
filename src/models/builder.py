@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
@@ -285,6 +285,7 @@ class MDDModelBuilder(nn.Module):
         self,
         input_values: torch.Tensor,
         linguistic: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through the full multimodal pipeline.
 
@@ -295,6 +296,11 @@ class MDDModelBuilder(nn.Module):
             linguistic:
                 Canonical phoneme token indices (padded).
                 Shape ``[B, N]`` or ``[N]`` for a single sample.
+            attention_mask:
+                Optional binary mask marking real samples (1) vs. padding
+                (0).  Shape ``[B, T_audio]``.  When ``None`` (e.g. during
+                single-sample inference) the Wav2Vec2 transformer attends
+                to all positions.
 
         Returns:
             Logits tensor of shape ``[B, T_audio', vocab_size]``, where
@@ -303,7 +309,7 @@ class MDDModelBuilder(nn.Module):
         """
         # (a) Wav2Vec2 backbone — raw phonetic hidden states
         phonetic: torch.Tensor = self.wav2vec2(
-            input_values, attention_mask=None
+            input_values, attention_mask=attention_mask
         )[0]  # [B, T, 768]
 
         # (b) Phonetic refinement — CNN + BiLSTM

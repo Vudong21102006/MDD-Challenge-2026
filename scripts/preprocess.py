@@ -24,15 +24,28 @@ SPECIAL_TOKENS = ["[PAD]", "[UNK]", "|"]
 
 
 def find_metadata_file(metadata_dir: Path) -> Path:
+    """Return the most suitable metadata CSV from ``metadata_dir``.
+
+    Prefers ``*_phones.csv`` (phoneme-level annotations) over readable-text
+    CSVs, since phoneme tokens are required for both vocabulary alignment
+    and the model's phoneme-prediction task.  If no phones file exists, the
+    alphabetically-first CSV is returned.
+    """
     if not metadata_dir.exists():
         raise FileNotFoundError(f"Metadata directory not found: {metadata_dir}")
 
-    for path in sorted(metadata_dir.glob("*.csv")):
-        return path
+    csv_files = sorted(metadata_dir.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No CSV metadata file found in {metadata_dir}."
+        )
 
-    raise FileNotFoundError(
-        f"No CSV metadata file found in {metadata_dir}."
-    )
+    # Prefer phoneme-level metadata when available
+    phones_files = [p for p in csv_files if p.name.endswith("_phones.csv")]
+    if phones_files:
+        return phones_files[0]
+
+    return csv_files[0]
 
 
 def identify_columns(row: Dict[str, str]) -> Tuple[str, str]:
@@ -111,9 +124,15 @@ def load_dataset_rows(csv_path: Path, raw_audio_dir: Path, max_duration: Optiona
 
 
 def build_vocab(ipa_texts: List[str]) -> Dict[str, int]:
-    tokens = set()
+    """Build a token-level vocabulary from space-separated IPA phoneme strings.
+
+    Each element in ``ipa_texts`` is a string of space-delimited phoneme
+    tokens (e.g. ``"aː-0 m aː-4 ɗ"``).  The function splits on whitespace
+    to collect unique *phoneme tokens* (not individual characters).
+    """
+    tokens: set[str] = set()
     for text in ipa_texts:
-        tokens.update(text)
+        tokens.update(text.split())
 
     tokens -= set(SPECIAL_TOKENS)
     sorted_tokens = sorted(tokens)
@@ -121,6 +140,51 @@ def build_vocab(ipa_texts: List[str]) -> Dict[str, int]:
     for token in sorted_tokens:
         if token not in vocab:
             vocab[token] = len(vocab)
+    return vocab
+
+
+def build_vocab_from_lexicon(lexicon_path: Path) -> Dict[str, int]:
+    """Build vocabulary from a lexicon file.
+
+    The lexicon is expected to be a file where each line has the format
+    ``word PHONEME_SEQ`` — the word and the IPA phoneme sequence are
+    separated by the **first** space on the line.  The phoneme sequence
+    itself is a space-delimited series of IPA tokens (e.g. ``ɓ aː-0 nz``).
+
+    All unique phoneme tokens found across every line are collected and
+    assigned IDs, with the standard special tokens placed first.
+    """
+    if not lexicon_path.exists():
+        raise FileNotFoundError(f"Lexicon file not found: {lexicon_path}")
+
+    phonemes: set[str] = set()
+    with lexicon_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Split on the *first* space to separate word from phoneme seq
+            first_space = line.find(" ")
+            if first_space == -1:
+                continue
+            ipa_column = line[first_space + 1:].strip()
+            if ipa_column:
+                phonemes.update(ipa_column.split())
+
+    if not phonemes:
+        raise ValueError(f"No phoneme tokens found in lexicon: {lexicon_path}")
+
+    # Remove any special tokens that might appear as real phonemes (unlikely)
+    tokens = phonemes - set(SPECIAL_TOKENS)
+    sorted_tokens = sorted(tokens)
+
+    # Build vocab: special tokens first, then alphabetically
+    vocab: Dict[str, int] = {
+        token: idx for idx, token in enumerate(SPECIAL_TOKENS)
+    }
+    for token in sorted_tokens:
+        vocab[token] = len(vocab)
+
     return vocab
 
 
@@ -165,23 +229,35 @@ def main() -> None:
 
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use existing vocab.json if present (from BTC); otherwise build from data.
+    # ── Build vocabulary ───────────────────────────────────────────────────
     vocab_path = processed_dir / "vocab.json"
+    lexicon_path = metadata_dir / "lexicon_vmd.txt"
+
     if vocab_path.exists():
         try:
             vocab = load_json(vocab_path)
+            print(f"Loaded existing vocab with {len(vocab)} entries")
         except Exception:
-            vocab = build_vocab([r["transcript"] for r in rows])
+            if lexicon_path.exists():
+                vocab = build_vocab_from_lexicon(lexicon_path)
+                print(f"Built vocab from lexicon ({len(vocab)} entries)")
+            else:
+                vocab = build_vocab([r["transcript"] for r in rows])
+                print(f"Built vocab from metadata CSV ({len(vocab)} entries)")
+    elif lexicon_path.exists():
+        vocab = build_vocab_from_lexicon(lexicon_path)
+        print(f"Built vocab from lexicon ({len(vocab)} entries)")
     else:
         vocab = build_vocab([r["transcript"] for r in rows])
+        print(f"Built vocab from metadata CSV ({len(vocab)} entries)")
 
-    save_json(vocab, processed_dir / "vocab.json")
+    save_json(vocab, vocab_path)
 
     train_rows, val_rows = split_dataset(rows, validation_split, seed)
     save_split(train_rows, processed_dir / "train_split.csv")
     save_split(val_rows, processed_dir / "val_split.csv")
 
-    print(f"Saved vocab with {len(vocab)} entries to {processed_dir / 'vocab.json'}")
+    print(f"Saved vocab with {len(vocab)} entries to {vocab_path}")
     print(f"Saved {len(train_rows)} train rows to {processed_dir / 'train_split.csv'}")
     print(f"Saved {len(val_rows)} val rows to {processed_dir / 'val_split.csv'}")
 

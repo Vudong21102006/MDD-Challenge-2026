@@ -28,11 +28,31 @@ class PhonemeTokenizer:
         return vocab
 
     def encode(self, text: str) -> List[int]:
-        return [self.vocab.get(char, self.unk_token_id) for char in text]
+        """Encode a space-separated phoneme sequence into token IDs.
+
+        Args:
+            text: Space-delimited IPA phoneme string
+                  (e.g. ``"aː-0 m aː-4 ɗ"``).
+
+        Returns:
+            List of integer token IDs, one per phoneme token.
+        """
+        return [
+            self.vocab.get(token, self.unk_token_id)
+            for token in text.split()
+        ]
 
     def decode(self, ids: List[int]) -> str:
+        """Decode a list of token IDs back to a space-separated phoneme string.
+
+        Args:
+            ids: List of integer token IDs.
+
+        Returns:
+            Space-separated phoneme string.
+        """
         reverse = {idx: token for token, idx in self.vocab.items()}
-        return "".join(reverse.get(i, self.unk_token) for i in ids)
+        return " ".join(reverse.get(i, self.unk_token) for i in ids)
 
 
 class PhonemeDataset(Dataset):

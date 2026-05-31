@@ -183,13 +183,16 @@ class MDDTrainer:
         running_loss: float = 0.0
 
         for step, batch in enumerate(self.train_loader):
-            input_values, linguistic, transcript, target_lengths, input_lengths = (
-                self._batch_to_device(batch)
-            )
+            (
+                input_values, linguistic, transcript,
+                target_lengths, input_lengths, attention_mask,
+            ) = self._batch_to_device(batch)
 
             with torch.amp.autocast(device_type='cuda', enabled=self.fp16):
                 # Forward pass
-                logits = self.model(input_values, linguistic)  # [B, T, V]
+                logits = self.model(
+                    input_values, linguistic, attention_mask=attention_mask
+                )  # [B, T, V]
 
                 # Prepare logits for CTC: log_softmax + [B, T, V] → [T, B, V]
                 logits = logits.log_softmax(dim=2).transpose(0, 1)
@@ -238,11 +241,14 @@ class MDDTrainer:
         total_loss: float = 0.0
 
         for batch in self.dev_loader:
-            input_values, linguistic, transcript, target_lengths, input_lengths = (
-                self._batch_to_device(batch)
-            )
+            (
+                input_values, linguistic, transcript,
+                target_lengths, input_lengths, attention_mask,
+            ) = self._batch_to_device(batch)
 
-            logits = self.model(input_values, linguistic)  # [B, T, V]
+            logits = self.model(
+                input_values, linguistic, attention_mask=attention_mask
+            )  # [B, T, V]
             logits = logits.log_softmax(dim=2).transpose(0, 1)
 
             ctc_input_lengths = (

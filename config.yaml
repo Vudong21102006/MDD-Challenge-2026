@@ -49,3 +49,6 @@ data:
   validation_split: 0.1
   # Maximum audio duration in seconds (samples exceeding this are skipped).
   max_duration: 30.0
+
+# Directory where training checkpoints are saved.
+checkpoint_dir: "experiments/checkpoints"
