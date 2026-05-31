@@ -273,11 +273,15 @@ class MDDModelBuilder(nn.Module):
             batch_first=True,
         )
 
-        # ── 4. Output projection ─────────────────────────────────────────
-        # Concatenation of [attention_output | phonetic] doubles the dim
-        self.output_projection = nn.Linear(
-            self.HIDDEN_DIM * 2, vocab_size, bias=True
-        )
+        # ── 4. Gated fusion ──────────────────────────────────────────────
+        # Learned gate decides per-frame how much to trust the canonical
+        # (attn_output) vs. the raw audio (phonetic).  Replaces naive concat.
+        self.gate_proj = nn.Linear(self.HIDDEN_DIM * 2, self.HIDDEN_DIM)
+        self.output_projection = nn.Linear(self.HIDDEN_DIM, vocab_size)
+
+        # ── 5. Detection head ────────────────────────────────────────────
+        # Binary logit per frame: 1 = mispronunciation, 0 = correct.
+        self.detection_head = nn.Linear(self.HIDDEN_DIM, 1)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -286,26 +290,25 @@ class MDDModelBuilder(nn.Module):
         input_values: torch.Tensor,
         linguistic: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_detection: bool = False,
+    ):
         """Forward pass through the full multimodal pipeline.
 
         Args:
             input_values:
-                Processed audio waveforms from the feature extractor.
-                Shape ``[B, T_audio]``.
+                Raw audio waveforms.  Shape ``[B, T_audio]``.
             linguistic:
-                Canonical phoneme token indices (padded).
-                Shape ``[B, N]`` or ``[N]`` for a single sample.
+                Canonical phoneme token indices (padded).  Shape ``[B, N]``.
             attention_mask:
-                Optional binary mask marking real samples (1) vs. padding
-                (0).  Shape ``[B, T_audio]``.  When ``None`` (e.g. during
-                single-sample inference) the Wav2Vec2 transformer attends
-                to all positions.
+                Optional binary mask for waveform padding.  ``[B, T_audio]``.
+            return_detection:
+                When ``True``, also returns frame-level mispronunciation
+                logits (used during training).
 
         Returns:
-            Logits tensor of shape ``[B, T_audio', vocab_size]``, where
-            ``T_audio'`` is the time dimension after Wav2Vec2's feature
-            encoder down-sampling.
+            - **logits** — ``[B, Tf, vocab_size]`` phoneme logits (always).
+            - **detection** — ``[B, Tf]`` binary mispronunciation logits
+              (only when ``return_detection=True``).
         """
         # (a) Wav2Vec2 backbone — raw phonetic hidden states
         phonetic: torch.Tensor = self.wav2vec2(
@@ -324,13 +327,16 @@ class MDDModelBuilder(nn.Module):
             query=phonetic, key=h_k, value=h_v,
         )  # [B, T, 768]
 
-        # (e) Residual-style fusion — concatenate attention + original
-        fused: torch.Tensor = torch.cat(
-            (attn_output, phonetic), dim=2
-        )  # [B, T, 1536]
+        # (e) Gated fusion — learned per-frame weighting of the two streams
+        gate_input = torch.cat((attn_output, phonetic), dim=2)       # [B, T, 1536]
+        gate = torch.sigmoid(self.gate_proj(gate_input))             # [B, T, 768]
+        fused: torch.Tensor = gate * attn_output + (1.0 - gate) * phonetic  # [B, T, 768]
 
         # (f) Output projection to vocabulary space
-        logits: torch.Tensor = self.output_projection(fused)
-        # [B, T, vocab_size]
+        logits: torch.Tensor = self.output_projection(fused)         # [B, T, V]
+
+        if return_detection:
+            detection: torch.Tensor = self.detection_head(fused).squeeze(-1)  # [B, T]
+            return logits, detection
 
         return logits

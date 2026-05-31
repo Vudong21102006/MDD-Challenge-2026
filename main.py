@@ -9,11 +9,12 @@ training loop.  Run from the project root::
 
 from __future__ import annotations
 
+import csv
 import os
 from typing import Tuple
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.data.collator import DataCollatorCTCWithPadding
 from src.data.dataset import PhonemeDataset
@@ -27,6 +28,36 @@ TRAIN_CSV: str = "data/processed/train_split.csv"
 VAL_CSV: str = "data/processed/val_split.csv"
 VOCAB_PATH: str = "data/processed/vocab.json"
 CONFIG_PATH: str = "config.yaml"
+
+# Weight multiplier for mispronounced samples in the weighted sampler
+MISPRONUNCIATION_WEIGHT: float = 5.0
+
+
+def _compute_sample_weights(csv_path: str) -> Tuple[list, int, int]:
+    """Assign higher sampling weights to mispronounced utterances.
+
+    Reads the split CSV and compares each row's ``canonical`` and
+    ``transcript`` columns.  Samples where the two differ receive
+    ``MISPRONUNCIATION_WEIGHT``; correct-pronunciation samples receive
+    weight 1.0.
+
+    Returns:
+        ``(weights, num_correct, num_mispronounced)``.
+    """
+    weights: list = []
+    correct = 0
+    mis = 0
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row["canonical"].strip() == row["transcript"].strip():
+                weights.append(1.0)
+                correct += 1
+            else:
+                weights.append(MISPRONUNCIATION_WEIGHT)
+                mis += 1
+
+    return weights, correct, mis
 
 
 def _build_loaders(
@@ -56,8 +87,6 @@ def _build_loaders(
     print(f"Vocabulary size: {vocab_size}")
 
     # ── Collator ──────────────────────────────────────────────────────────
-    # canonical (linguistic) labels padded with 0  = [PAD] token id
-    # transcript labels          padded with -100 = CTC ignore_index
     collator = DataCollatorCTCWithPadding(
         padding_value=0.0,
         transcript_pad_token_id=-100,
@@ -68,10 +97,22 @@ def _build_loaders(
     train_cfg: dict = config["training"]
     batch_size: int = int(train_cfg["batch_size"])
 
+    # Weighted sampling — mispronounced samples get 5× more exposure
+    sample_weights, num_correct, num_mis = _compute_sample_weights(TRAIN_CSV)
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+    print(
+        f"Train samples: {len(sample_weights)} "
+        f"(correct={num_correct}, mispronounced={num_mis})"
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,
         collate_fn=collator,
         num_workers=2,
         pin_memory=True,
