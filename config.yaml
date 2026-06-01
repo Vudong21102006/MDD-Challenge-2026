@@ -39,7 +39,11 @@ training:
   seed: 42
   # Weight for the detection (BCE) loss relative to CTC loss.
   # Higher values force the model to focus more on mispronunciation detection.
-  detection_lambda: 0.3
+  detection_lambda: 1.0
+  # Weight for the gate regularisation loss (encourages bimodal gate values).
+  gate_lambda: 0.1
+  # Number of epochs to train with CTC loss only before enabling detection loss.
+  detection_warmup_epochs: 5
 
 data:
   # Relative paths (from project root).

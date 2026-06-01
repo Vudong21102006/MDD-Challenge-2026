@@ -337,6 +337,8 @@ class MDDModelBuilder(nn.Module):
 
         if return_detection:
             detection: torch.Tensor = self.detection_head(fused).squeeze(-1)  # [B, T]
-            return logits, detection
+            # Gate mean per frame (averaged over hidden dim) for regularisation
+            gate_mean: torch.Tensor = gate.mean(dim=-1)  # [B, T]
+            return logits, detection, gate_mean
 
         return logits

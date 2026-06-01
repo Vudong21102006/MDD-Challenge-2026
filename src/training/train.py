@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from torch import nn
@@ -9,25 +9,26 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
+from src.utils.evaluate import _align  # Needleman-Wunsch aligner
+
 
 class MDDTrainer:
     """High-performance trainer for the MDD multimodal model.
 
-    Orchestrates training with Automatic Mixed Precision (AMP), gradient
-    accumulation, linear learning-rate warmup + decay, a joint **CTC +
-    detection** loss, and gated-fusion mispronunciation detection.
-    Checkpoints are saved whenever the combined validation loss reaches a
-    new minimum.
+    Jointly optimises **CTC loss** (phoneme recognition) and **detection
+    loss** (mispronunciation flagging) with:
 
-    Args:
-        config:  Full configuration dictionary (parsed from ``config.yaml``).
-        model:   :class:`MDDModelBuilder` whose ``forward(…,
-                 return_detection=True)`` returns ``(logits, detection)``.
-        train_loader:  Training DataLoader yielding the 6-tuple produced by
-                       :class:`DataCollatorCTCWithPadding`.
-        dev_loader:    Validation DataLoader (same format).
-        device:        PyTorch device to run on.
+    * Proper Needleman-Wunsch alignment for frame-level detection labels
+      (replaces crude uniform stretching).
+    * Gate regularisation — encourages the gated-fusion gate to make
+      decisive per-frame choices rather than sitting at 0.5.
+    * Detection warmup — freezes the detection head for the first
+      ``detection_warmup_epochs`` so phoneme recognition stabilises before
+      the detection signal kicks in.
     """
+
+    # ── CTC blank token ID ──────────────────────────────────────────────────
+    BLANK_ID: int = 0
 
     def __init__(
         self,
@@ -60,9 +61,15 @@ class MDDTrainer:
         self.load_best_model_at_end: bool = bool(
             train_cfg.get("load_best_model_at_end", True)
         )
-        # Weight for the detection (BCE) loss relative to CTC loss
+        # Joint-loss weights
         self.detection_lambda: float = float(
-            train_cfg.get("detection_lambda", 0.3)
+            train_cfg.get("detection_lambda", 1.0)
+        )
+        self.gate_lambda: float = float(
+            train_cfg.get("gate_lambda", 0.1)
+        )
+        self.detection_warmup_epochs: int = int(
+            train_cfg.get("detection_warmup_epochs", 5)
         )
 
         # ── Optimiser ──────────────────────────────────────────────────────
@@ -105,7 +112,7 @@ class MDDTrainer:
         self.scaler = torch.amp.GradScaler(device="cuda", enabled=self.fp16)
 
         # ── Losses ─────────────────────────────────────────────────────────
-        self.ctc_loss_fn = nn.CTCLoss(blank=0, zero_infinity=True)
+        self.ctc_loss_fn = nn.CTCLoss(blank=self.BLANK_ID, zero_infinity=True)
         self.det_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
 
         # ── Checkpointing ──────────────────────────────────────────────────
@@ -117,6 +124,7 @@ class MDDTrainer:
             self.checkpoint_dir, "best_model.pt"
         )
         self.best_val_loss: float = float("inf")
+        self._current_epoch: int = 0
 
         # Move model to device
         self.model = self.model.to(self.device)
@@ -131,11 +139,14 @@ class MDDTrainer:
             f"Epochs: {self.epochs} | "
             f"Gradient accumulation: {self.gradient_accumulation_steps} | "
             f"FP16: {self.fp16} | "
-            f"Detection λ: {self.detection_lambda}"
+            f"Detection λ: {self.detection_lambda} | "
+            f"Gate λ: {self.gate_lambda} | "
+            f"Detection warmup: {self.detection_warmup_epochs} epochs"
         )
         self._print_trainable_parameters()
 
         for epoch in range(1, self.epochs + 1):
+            self._current_epoch = epoch
             train_ctc, train_det = self._train_one_epoch(epoch)
             val_ctc, val_det = self._evaluate()
             val_combined = val_ctc + self.detection_lambda * val_det
@@ -162,7 +173,7 @@ class MDDTrainer:
                 f"combined_val_loss={self.best_val_loss:.4f}"
             )
 
-    # ── Private helpers ──────────────────────────────────────────────────────
+    # ── Private: training & evaluation ───────────────────────────────────────
 
     def _train_one_epoch(self, epoch: int) -> Tuple[float, float]:
         """Execute a single training epoch.
@@ -174,6 +185,11 @@ class MDDTrainer:
         running_ctc: float = 0.0
         running_det: float = 0.0
 
+        # Detection warmup: freeze detection head for early epochs
+        det_enabled = epoch > self.detection_warmup_epochs
+        if self.detection_warmup_epochs > 0:
+            self._set_detection_grad(det_enabled)
+
         for step, batch in enumerate(self.train_loader):
             (
                 input_values, linguistic, transcript,
@@ -181,12 +197,12 @@ class MDDTrainer:
             ) = self._batch_to_device(batch)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.fp16):
-                # Forward pass — returns both phoneme logits and detection scores
-                logits, detection = self.model(
+                # Forward pass — returns phoneme logits, detection scores, gate
+                logits, detection, gate = self.model(
                     input_values, linguistic,
                     attention_mask=attention_mask,
                     return_detection=True,
-                )  # logits: [B, Tf, V]  |  detection: [B, Tf]
+                )  # logits: [B,Tf,V]  detection: [B,Tf]  gate: [B,Tf]
 
                 # ── CTC loss ────────────────────────────────────────────
                 ctc_logits = logits.log_softmax(dim=2).transpose(0, 1)
@@ -200,17 +216,27 @@ class MDDTrainer:
                 )
 
                 # ── Detection (BCE) loss ────────────────────────────────
+                # Build clean targets via CTC segmentation + NW alignment
                 det_targets = self._build_detection_targets(
-                    linguistic, transcript, input_lengths
+                    logits, linguistic, ctc_input_lengths
                 )
                 det_mask = self._build_frame_mask(detection, ctc_input_lengths)
-                det_loss = (
-                    self.det_loss_fn(detection, det_targets) * det_mask
-                ).sum() / det_mask.sum().clamp(min=1)
+
+                if det_enabled:
+                    det_loss = (
+                        self.det_loss_fn(detection, det_targets) * det_mask
+                    ).sum() / det_mask.sum().clamp(min=1)
+                else:
+                    det_loss = torch.tensor(0.0, device=self.device)
+
+                # ── Gate regularisation ─────────────────────────────────
+                gate_reg = self._compute_gate_regularization(gate, det_mask)
 
                 # ── Combined loss ───────────────────────────────────────
                 loss = (
-                    ctc_loss + self.detection_lambda * det_loss
+                    ctc_loss
+                    + self.detection_lambda * det_loss
+                    + self.gate_lambda * gate_reg
                 ) / self.gradient_accumulation_steps
 
             # Backward pass with gradient scaling
@@ -238,11 +264,7 @@ class MDDTrainer:
 
     @torch.no_grad()
     def _evaluate(self) -> Tuple[float, float]:
-        """Evaluate the model on the validation set.
-
-        Returns:
-            ``(avg_ctc_loss, avg_detection_loss)``.
-        """
+        """Evaluate the model on the validation set."""
         self.model.eval()
         total_ctc: float = 0.0
         total_det: float = 0.0
@@ -253,7 +275,7 @@ class MDDTrainer:
                 target_lengths, input_lengths, attention_mask,
             ) = self._batch_to_device(batch)
 
-            logits, detection = self.model(
+            logits, detection, _gate = self.model(
                 input_values, linguistic,
                 attention_mask=attention_mask,
                 return_detection=True,
@@ -272,7 +294,7 @@ class MDDTrainer:
 
             # Detection loss
             det_targets = self._build_detection_targets(
-                linguistic, transcript, input_lengths
+                logits, linguistic, ctc_input_lengths
             )
             det_mask = self._build_frame_mask(detection, ctc_input_lengths)
             det_loss = (
@@ -285,84 +307,156 @@ class MDDTrainer:
         n = len(self.dev_loader)
         return total_ctc / n, total_det / n
 
-    # ── Detection label helpers ──────────────────────────────────────────────
+    # ── Detection-target builder (NW-alignment based) ────────────────────────
 
     def _build_detection_targets(
         self,
+        logits: torch.Tensor,
         linguistic: torch.Tensor,
-        transcript: torch.Tensor,
-        input_lengths: torch.Tensor,
+        feat_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """Build frame-level binary mismatch labels.
+        """Build frame-level binary mismatch labels using CTC segmentation
+        followed by Needleman-Wunsch alignment against the canonical sequence.
 
-        Compares *transcript* (what the student said) against *canonical*
-        (what they should have said) phoneme-by-phoneme, then stretches the
-        phoneme-level labels to the Wav2Vec2 frame grid via uniform
-        stretching.
+        This replaces the crude uniform-stretching approach with proper
+        sequence alignment, giving much cleaner supervision to the detection
+        head.
 
         Args:
+            logits:        Phoneme logits ``[B, Tf, V]`` (pre-softmax).
             linguistic:    Canonical phoneme IDs, padded with 0  ``[B, Nc]``.
-            transcript:    Transcript phoneme IDs, padded with -100 ``[B, Nt]``.
-            input_lengths: Raw waveform sample counts ``[B]``.
+            feat_lengths:  Valid frame counts per sample ``[B]``.
 
         Returns:
-            Binary float tensor ``[B, max_Tf]`` where 1.0 indicates a
-            mispronounced frame.
+            Binary float tensor ``[B, max_Tf]``.  1.0 = mispronounced frame.
         """
-        feat_lengths = self.model.wav2vec2._get_feat_extract_output_lengths(
-            input_lengths
-        )
-        B = linguistic.size(0)
-        max_T = feat_lengths.max().item()
-        targets = torch.zeros(B, max_T, device=linguistic.device)
+        B, max_T, _ = logits.shape
+        targets = torch.zeros(B, max_T, device=logits.device)
 
         for b in range(B):
             T = feat_lengths[b].item()
             if T <= 0:
                 continue
 
-            # Extract non-padded phoneme IDs
-            c_ids = linguistic[b][linguistic[b] != 0].tolist()       # canonical (pad=0)
-            t_ids = transcript[b][transcript[b] != -100].tolist()    # transcript (pad=-100)
+            # ── 1. CTC segmentation: collapse argmax into (phoneme, boundaries) ──
+            pred_ids = logits[b, :T].argmax(dim=-1).tolist()  # [T]
+            phonemes, boundaries = self._ctc_collapse_with_boundaries(pred_ids)
+            # phonemes:   list of token IDs
+            # boundaries: list of (start_frame, end_frame) pairs
 
-            min_len = min(len(c_ids), len(t_ids))
-            if min_len == 0:
+            # ── 2. Get canonical phoneme IDs (strip PAD = 0) ─────────────────
+            canon_ids = linguistic[b][linguistic[b] != 0].tolist()
+
+            if not canon_ids or not phonemes:
                 continue
 
-            # Phoneme-level mismatch: 1 where student ≠ canonical
-            phoneme_labels = [
-                1.0 if t_ids[i] != c_ids[i] else 0.0
-                for i in range(min_len)
-            ]
-            n = len(phoneme_labels)
+            # ── 3. Needleman-Wunsch alignment ────────────────────────────────
+            aligned_pred, aligned_canon = _align(phonemes, canon_ids)
+            # aligned_pred:   list of token IDs (with <eps> for gaps)
+            # aligned_canon:  list of token IDs (with <eps> for gaps)
 
-            # Uniform stretching: map each phoneme position to T/n frames
-            for i, label in enumerate(phoneme_labels):
-                start = int(i * T / n)
-                end = int((i + 1) * T / n)
-                targets[b, start:end] = label
+            # ── 4. Walk the aligned sequences and mark mismatch frames ───────
+            pred_idx = 0  # index into the non-gap predicted phonemes
+            for p_tok, c_tok in zip(aligned_pred, aligned_canon):
+                if p_tok == "<eps>" or c_tok == "<eps>":
+                    # Insertion or deletion — flag as potential mismatch
+                    if pred_idx < len(boundaries):
+                        s, e = boundaries[pred_idx]
+                        targets[b, s:e] = 1.0
+                    if p_tok != "<eps>":
+                        pred_idx += 1
+                    continue
+
+                if pred_idx < len(boundaries):
+                    if p_tok != c_tok:
+                        # Mismatch — mark these frames as mispronounced
+                        s, e = boundaries[pred_idx]
+                        targets[b, s:e] = 1.0
+                    # else: match — leave as 0.0 (correct)
+                pred_idx += 1
 
         return targets
+
+    # ── Gate regularisation ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_gate_regularization(
+        gate: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalise gate values that hover near 0.5 (indecision).
+
+        The gate should be *bimodal*: close to 0 (trust audio) or close to 1
+        (trust canonical).  Values in the flat region [0.2, 0.8] incur a
+        linear penalty.
+        """
+        # gate is [B, T] — mean gate value over the hidden dimension
+        deviation = (gate - 0.5).abs()           # distance from 0.5
+        penalty = (0.3 - deviation).clamp(min=0)  # penalise when within 0.3 of 0.5
+        return (penalty * mask).sum() / mask.sum().clamp(min=1)
+
+    # ── CTC segmentation helper ──────────────────────────────────────────────
+
+    @staticmethod
+    def _ctc_collapse_with_boundaries(
+        pred_ids: List[int],
+    ) -> Tuple[List[int], List[Tuple[int, int]]]:
+        """Collapse a CTC argmax sequence into phonemes with frame boundaries.
+
+        Consecutive identical token IDs are merged; *blank* tokens are
+        removed.  Each surviving phoneme is paired with its ``(start, end)``
+        frame range.
+
+        Args:
+            pred_ids:  List of token IDs over T frames (e.g. from ``argmax``).
+
+        Returns:
+            ``(phonemes, boundaries)`` where *phonemes* is a list of token
+            IDs and *boundaries* is a list of ``(start, end)`` frame indices
+            (end is exclusive).
+        """
+        phonemes: List[int] = []
+        boundaries: List[Tuple[int, int]] = []
+
+        prev = MDDTrainer.BLANK_ID
+        start = 0
+
+        for t, pid in enumerate(pred_ids):
+            if pid != prev:
+                if prev != MDDTrainer.BLANK_ID:
+                    phonemes.append(prev)
+                    boundaries.append((start, t))
+                start = t
+            prev = pid
+
+        # Don't forget the last segment
+        if prev != MDDTrainer.BLANK_ID:
+            phonemes.append(prev)
+            boundaries.append((start, len(pred_ids)))
+
+        return phonemes, boundaries
+
+    # ── Frame mask builder ───────────────────────────────────────────────────
 
     @staticmethod
     def _build_frame_mask(
         detection: torch.Tensor,
         feat_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """Build a binary mask that is 1 for valid frames, 0 for padding.
-
-        Args:
-            detection:    Detection scores ``[B, max_T]``.
-            feat_lengths: Valid frame counts per sample ``[B]``.
-
-        Returns:
-            Float mask of shape ``[B, max_T]``.
-        """
+        """Build a binary mask that is 1 for valid frames, 0 for padding."""
         B, max_T = detection.shape
         mask = torch.zeros(B, max_T, device=detection.device)
         for b in range(B):
             mask[b, : feat_lengths[b].item()] = 1.0
         return mask
+
+    # ── Detection-head grad control ──────────────────────────────────────────
+
+    def _set_detection_grad(self, enabled: bool) -> None:
+        """Enable or disable gradients for the detection head and gate."""
+        for name, param in self.model.named_parameters():
+            if "detection_head" in name or "gate_proj" in name:
+                param.requires_grad = enabled
 
     # ── Utilities ────────────────────────────────────────────────────────────
 
