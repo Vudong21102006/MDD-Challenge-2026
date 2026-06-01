@@ -19,6 +19,7 @@ CLAUDE.MD
 *.wav
 *.mp3
 *.flac
+*.zip
 
 # Bỏ qua các file trong thư mục experiments/
 experiments/*
