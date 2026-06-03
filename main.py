@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import os
+from pathlib import Path
 from typing import Tuple
 
 import torch
@@ -24,13 +25,16 @@ from src.utils.file_utils import load_config
 
 
 # ── Paths (relative to project root) ─────────────────────────────────────────
-TRAIN_CSV: str = "data/processed/train_split.csv"
+# Prefer the synthetic split if it exists (created by scripts/synthesize_errors.py)
+SYNTHETIC_CSV: str = "data/processed/train_split_synthetic.csv"
+ORIGINAL_TRAIN_CSV: str = "data/processed/train_split.csv"
 VAL_CSV: str = "data/processed/val_split.csv"
 VOCAB_PATH: str = "data/processed/vocab.json"
 CONFIG_PATH: str = "config.yaml"
 
-# Weight multiplier for mispronounced samples in the weighted sampler
-MISPRONUNCIATION_WEIGHT: float = 5.0
+# Weight multiplier for mispronounced samples — reduced from 5.0 since
+# synthetic data already boosts error representation to ~40%.
+MISPRONUNCIATION_WEIGHT: float = 2.0
 
 
 def _compute_sample_weights(csv_path: str) -> Tuple[list, int, int]:
@@ -70,8 +74,11 @@ def _build_loaders(
         ``(train_loader, dev_loader, vocab_size)``.
     """
     # ── Datasets ──────────────────────────────────────────────────────────
+    # Use synthetic split if available, otherwise fall back to original
+    train_csv = SYNTHETIC_CSV if Path(SYNTHETIC_CSV).exists() else ORIGINAL_TRAIN_CSV
+
     train_dataset = PhonemeDataset(
-        split_csv=TRAIN_CSV,
+        split_csv=train_csv,
         vocab_path=vocab_path,
         add_noise=True,
         noise_prob=0.3,
@@ -98,7 +105,7 @@ def _build_loaders(
     batch_size: int = int(train_cfg["batch_size"])
 
     # Weighted sampling — mispronounced samples get 5× more exposure
-    sample_weights, num_correct, num_mis = _compute_sample_weights(TRAIN_CSV)
+    sample_weights, num_correct, num_mis = _compute_sample_weights(train_csv)
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(sample_weights),
