@@ -279,18 +279,9 @@ class MDDModelBuilder(nn.Module):
         self.gate_proj = nn.Linear(self.HIDDEN_DIM * 2, self.HIDDEN_DIM)
         self.output_projection = nn.Linear(self.HIDDEN_DIM, vocab_size)
 
-        # ── 5. Detection head (MLP) ──────────────────────────────────────
-        # Small MLP learns non-linear mismatch patterns.
-        # 768 → 256 → 64 → 1  with ReLU + Dropout.
-        self.detection_head = nn.Sequential(
-            nn.Linear(self.HIDDEN_DIM, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1),
-        )
+        # ── 5. Detection head ────────────────────────────────────────────
+        # Binary logit per frame: 1 = mispronunciation, 0 = correct.
+        self.detection_head = nn.Linear(self.HIDDEN_DIM, 1)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -341,10 +332,8 @@ class MDDModelBuilder(nn.Module):
         gate = torch.sigmoid(self.gate_proj(gate_input))             # [B, T, 768]
         fused: torch.Tensor = gate * attn_output + (1.0 - gate) * phonetic  # [B, T, 768]
 
-        # (f) Phoneme output — pure audio features (bypasses gate)
-        #     Decoupled so the gate can swing aggressively for detection
-        #     without corrupting phoneme recognition.
-        logits: torch.Tensor = self.output_projection(phonetic)      # [B, T, V]
+        # (f) Output projection to vocabulary space
+        logits: torch.Tensor = self.output_projection(fused)         # [B, T, V]
 
         if return_detection:
             detection: torch.Tensor = self.detection_head(fused).squeeze(-1)  # [B, T]
