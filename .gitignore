@@ -24,3 +24,11 @@ CLAUDE.MD
 # Bỏ qua các file trong thư mục experiments/
 experiments/*
 !experiments/.gitkeep
+
+
+# Bỏ qua các file trong thư mục experiments/
+experiments/*
+!experiments/.gitkeep
+
+# Bỏ qua hoàn toàn thư mục public test 2025 và toàn bộ nội dung của nó
+data/MDD-Challenge-2025-public-test/
