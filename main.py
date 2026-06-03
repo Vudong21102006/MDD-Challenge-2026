@@ -104,6 +104,14 @@ def _build_loaders(
         num_samples=len(sample_weights),
         replacement=True,
     )
+    # Compute a simple detection pos_weight (utterance-level proxy).
+    # This boosts positive (mispronounced) frames proportionally during BCE.
+    pos_weight = 1.0
+    if num_mis > 0:
+        pos_weight = max(1.0, float(num_correct) / float(num_mis))
+    # Store into config for trainer to pick up
+    config.setdefault("training", {})["detection_pos_weight"] = pos_weight
+    print(f"Detection pos_weight (approx): {pos_weight:.3f}")
     print(
         f"Train samples: {len(sample_weights)} "
         f"(correct={num_correct}, mispronounced={num_mis})"
@@ -139,6 +147,21 @@ def main() -> None:
 
     # ── Configuration ─────────────────────────────────────────────────────
     config = load_config(CONFIG_PATH)
+    
+    # ── Config validation ─────────────────────────────────────────────────
+    train_cfg = config.get("training", {})
+    required_training_keys = ["learning_rate", "batch_size", "epochs"]
+    for key in required_training_keys:
+        if key not in train_cfg:
+            raise ValueError(f"Missing required training config key: {key}")
+    
+    # Validate hyperparameter ranges
+    if not (0 < train_cfg.get("warmup_ratio", 0.1) < 1):
+        raise ValueError("warmup_ratio must be between 0 and 1")
+    if train_cfg.get("detection_ohem_topk", 1.0) > 1.0 or train_cfg.get("detection_ohem_topk", 1.0) <= 0:
+        raise ValueError("detection_ohem_topk must be in (0, 1]")
+    if train_cfg.get("backbone_lr", train_cfg.get("learning_rate")) > train_cfg.get("learning_rate"):
+        print("Warning: backbone_lr should typically be lower than learning_rate for better fine-tuning")
 
     # ── Data pipeline ─────────────────────────────────────────────────────
     train_loader, dev_loader, vocab_size = _build_loaders(config, VOCAB_PATH)

@@ -6,15 +6,16 @@ model:
   # Pretrained Wav2Vec2 model fine-tuned on Vietnamese speech (250h).
   pretrained_name: "nguyenvulebinh/wav2vec2-base-vietnamese-250h"
   # Whether to freeze the feature extractor during training.
-  freeze_feature_extractor: true
+  freeze_feature_extractor: false
   # Attention dropout probability for the transformer layers.
   attention_dropout: 0.1
   # Hidden dropout probability for the transformer layers.
   hidden_dropout: 0.1
   # Whether to apply a mask to the feature encoder outputs during training.
-  mask_time_prob: 0.05
+  # Increasing this adds regularisation similar to SpecAugment.
+  mask_time_prob: 0.12
   # Length of each time mask (in time steps).
-  mask_time_length: 10
+  mask_time_length: 15
 
 training:
   # Peak learning rate (AdamW with linear warmup + linear decay).
@@ -30,16 +31,35 @@ training:
   # Weight decay applied to all parameters except biases and LayerNorm weights.
   weight_decay: 0.005
   # Metric used to select the best checkpoint during training.
-  metric_for_best_model: "loss"
+  metric_for_best_model: "f1"
   # Whether to load the best model at the end of training.
   load_best_model_at_end: true
   # FP16 mixed-precision training (set false for CPU-only environments).
   fp16: false
+  # Optional lower LR for the pretrained wav2vec2 backbone.
+  backbone_lr: 1.0e-5
+  # Maximum gradient norm for gradient clipping (0 = no clipping).
+  max_grad_norm: 1.0
+  # Use focal loss for the detection head (helps with class imbalance).
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_alpha: 0.75
   # Random seed for reproducibility.
   seed: 42
   # Weight for the detection (BCE) loss relative to CTC loss.
   # Higher values force the model to focus more on mispronunciation detection.
-  detection_lambda: 0.3
+  detection_lambda: 0.1
+  # Number of frames for label smoothing (0 = no smoothing). Applies a
+  # small box filter across frames to soften boundary uncertainty.
+  detection_label_smoothing_frames: 3
+  # Online Hard Example Mining: keep top fraction of hardest frames
+  # when computing detection loss (1.0 = keep all frames)
+  detection_ohem_topk: 0.6
+  # Beam search decoding (optional, for better phoneme hypotheses)
+  use_beam_search: true
+  beam_width: 5
+  # LM weight blending with model logits (0 = no LM, 1.0 = full LM prior)
+  lm_weight: 0.3
 
 data:
   # Relative paths (from project root).
@@ -55,3 +75,6 @@ data:
 
 # Directory where training checkpoints are saved.
 checkpoint_dir: "experiments/checkpoints"
+
+# Vocabulary path (for decoding phonemes)
+vocab_path: "data/processed/vocab.json"

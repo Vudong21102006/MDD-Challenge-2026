@@ -18,6 +18,7 @@ from transformers import Wav2Vec2FeatureExtractor
 from src.models.builder import MDDModelBuilder
 from src.utils.audio_utils import load_and_resample, to_mono
 from src.utils.file_utils import load_config, load_json
+from src.inference.beam_search import BeamSearchDecoder, build_vocab_counts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -104,6 +105,22 @@ class MDDPredictor:
             pretrained_name,
             return_attention_mask=False,
         )
+
+        # ── Beam search decoder (optional) ─────────────────────────────────
+        use_beam_search = self.config.get("use_beam_search", False)
+        beam_width = self.config.get("beam_width", 3)
+        lm_weight = self.config.get("lm_weight", 0.0)
+        self.beam_decoder = None
+
+        if use_beam_search:
+            self.beam_decoder = BeamSearchDecoder(
+                vocab_size=self.vocab_size,
+                beam_width=beam_width,
+                lm_weight=lm_weight,
+                vocab_counts=None,  # Built later from dataset if available
+            )
+            self.beam_decoder.set_id_to_token(self.id_to_token)
+            print(f"  Beam search enabled: width={beam_width}, lm_weight={lm_weight}")
 
         print(f"MDDPredictor initialised on {self.device}")
         print(f"  Vocabulary size: {self.vocab_size}")
@@ -208,6 +225,20 @@ class MDDPredictor:
     # ── Decoding ─────────────────────────────────────────────────────────────
 
     def _greedy_decode_tokens(self, frame_logits: torch.Tensor) -> str:
+        """Decode logits using beam search (if enabled) or greedy CTC.
+
+        Args:
+            frame_logits: Logits tensor of shape ``[T, V]`` (time × vocab).
+
+        Returns:
+            A space-separated string of predicted phoneme tokens.
+        """
+        if self.beam_decoder is not None:
+            return self.beam_decoder.decode(frame_logits)
+        else:
+            return self._greedy_ctc_decode(frame_logits)
+
+    def _greedy_ctc_decode(self, frame_logits: torch.Tensor) -> str:
         """Greedy CTC decode a single sample's frame-level logits.
 
         Steps:

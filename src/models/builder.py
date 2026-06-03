@@ -15,7 +15,7 @@ class PhoneCNNStack(nn.Module):
     """Convolutional stack for local phonetic feature refinement.
 
     Applies a 2D convolution (with a singleton channel dimension added
-    dynamically), followed by BatchNorm1d, ReLU activation, and Dropout.
+    dynamically), followed by LayerNorm, ReLU activation, and Dropout.
 
     Args:
         hidden_dim: Number of feature channels (must equal the input's
@@ -32,8 +32,8 @@ class PhoneCNNStack(nn.Module):
             padding=1,
         )
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.2)
-        self.batch_norm = nn.BatchNorm1d(hidden_dim)
+        self.dropout = nn.Dropout(p=0.3)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Refine phonetic features with Conv2d → BatchNorm → ReLU → Dropout.
@@ -54,8 +54,8 @@ class PhoneCNNStack(nn.Module):
         x = self.conv2d(x)                        # [*, 1, T, hidden_dim]
         x = x.squeeze(1)                          # [*, T, hidden_dim]  (≥3D)
 
-        # BatchNorm1d expects [N, C, L] — already 3D at this point
-        x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
+        # LayerNorm for better gradient flow
+        x = self.layer_norm(x)
         x = self.relu(x)
         x = self.dropout(x)
 
@@ -69,7 +69,7 @@ class PhoneRNNStack(nn.Module):
     """Bidirectional LSTM stack for temporal modelling of phonetic features.
 
     Halves the hidden size internally (since bidirectional doubles it back),
-    then applies BatchNorm1d and Dropout.
+    then applies LayerNorm and Dropout with optional residual connection.
 
     Args:
         hidden_dim: Input and output feature dimension.
@@ -78,17 +78,18 @@ class PhoneRNNStack(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.2)
-        self.batch_norm = nn.BatchNorm1d(hidden_dim)
+        self.dropout = nn.Dropout(p=0.3)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         self.bilstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim // 2,
             bidirectional=True,
             batch_first=True,
+            dropout=0.2 if hidden_dim > 256 else 0,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply BiLSTM → BatchNorm → Dropout.
+        """Apply BiLSTM → LayerNorm → Dropout with residual connection.
 
         Args:
             x: Tensor of shape ``[B, T, hidden_dim]``.
@@ -96,9 +97,12 @@ class PhoneRNNStack(nn.Module):
         Returns:
             Tensor of shape ``[B, T, hidden_dim]``.
         """
-        x, _ = self.bilstm(x)
-        x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
+        residual = x
+        lstm_out, _ = self.bilstm(x)
+        x = self.layer_norm(lstm_out)
+        x = self.relu(x)
         x = self.dropout(x)
+        x = x + residual  # Residual connection improves gradient flow
         return x
 
 
@@ -265,23 +269,32 @@ class MDDModelBuilder(nn.Module):
         self.linguistic_encoder = LinguisticEncoder()
 
         # ── 3. Cross-modal attention ─────────────────────────────────────
+        self.attn_layer_norm = nn.LayerNorm(self.HIDDEN_DIM)
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.HIDDEN_DIM,
             num_heads=self.NUM_HEADS,
             kdim=self.LINGUISTIC_PROJ_DIM,
             vdim=self.LINGUISTIC_PROJ_DIM,
             batch_first=True,
+            dropout=0.1,
         )
 
         # ── 4. Gated fusion ──────────────────────────────────────────────
         # Learned gate decides per-frame how much to trust the canonical
         # (attn_output) vs. the raw audio (phonetic).  Replaces naive concat.
+        self.fusion_layer_norm = nn.LayerNorm(self.HIDDEN_DIM * 2)
         self.gate_proj = nn.Linear(self.HIDDEN_DIM * 2, self.HIDDEN_DIM)
+        self.fusion_dropout = nn.Dropout(p=0.2)
+        self.output_layer_norm = nn.LayerNorm(self.HIDDEN_DIM)
         self.output_projection = nn.Linear(self.HIDDEN_DIM, vocab_size)
 
         # ── 5. Detection head ────────────────────────────────────────────
         # Binary logit per frame: 1 = mispronunciation, 0 = correct.
-        self.detection_head = nn.Linear(self.HIDDEN_DIM, 1)
+        # Multi-layer head for better feature extraction
+        self.detection_layer_norm = nn.LayerNorm(self.HIDDEN_DIM)
+        self.detection_hidden = nn.Linear(self.HIDDEN_DIM, self.HIDDEN_DIM // 2)
+        self.detection_dropout = nn.Dropout(p=0.3)
+        self.detection_head = nn.Linear(self.HIDDEN_DIM // 2, 1)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -326,17 +339,26 @@ class MDDModelBuilder(nn.Module):
         attn_output, _ = self.multihead_attn(
             query=phonetic, key=h_k, value=h_v,
         )  # [B, T, 768]
+        attn_output = self.attn_layer_norm(attn_output)
 
         # (e) Gated fusion — learned per-frame weighting of the two streams
         gate_input = torch.cat((attn_output, phonetic), dim=2)       # [B, T, 1536]
+        gate_input = self.fusion_layer_norm(gate_input)
         gate = torch.sigmoid(self.gate_proj(gate_input))             # [B, T, 768]
+        gate = self.fusion_dropout(gate)
         fused: torch.Tensor = gate * attn_output + (1.0 - gate) * phonetic  # [B, T, 768]
 
         # (f) Output projection to vocabulary space
+        fused = self.output_layer_norm(fused)
         logits: torch.Tensor = self.output_projection(fused)         # [B, T, V]
 
         if return_detection:
-            detection: torch.Tensor = self.detection_head(fused).squeeze(-1)  # [B, T]
+            # Multi-layer detection head for better mispronunciation signal
+            det = self.detection_layer_norm(fused)
+            det = self.detection_hidden(det)  # [B, T, hidden_dim//2]
+            det = torch.relu(det)
+            det = self.detection_dropout(det)
+            detection: torch.Tensor = self.detection_head(det).squeeze(-1)  # [B, T]
             return logits, detection
 
         return logits

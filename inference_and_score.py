@@ -36,10 +36,8 @@ CHECKPOINT_CANDIDATES: Tuple[str, ...] = (
 VOCAB_PATH: str = "data/processed/vocab.json"
 
 # Public test dataset paths
-PUBLIC_TEST_DIR: str = "data/MDD-Challenge-2025-public-test"
-PUBLIC_TEST_CSV: str = (
-    "data/MDD-Challenge-2025-public-test/metadata/public_test_phones.csv"
-)
+PUBLIC_TEST_DIR: str = "D:/Challenge2/MDD-Challenge-2026/data/MDD-Challenge-2025-public-test"
+PUBLIC_TEST_CSV: str = "D:/Challenge2/MDD-Challenge-2026/data/MDD-Challenge-2025-public-test/metadata/public_test_phones.csv"
 
 SAMPLE_RATE: int = 16000
 BLANK_ID: int = 0
