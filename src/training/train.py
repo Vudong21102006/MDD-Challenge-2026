@@ -175,6 +175,9 @@ class MDDTrainer:
             self.best_metric = float("inf")
             self.metric_mode = "min"
 
+        # Best validation loss is tracked separately for checkpoint metadata.
+        self.best_val_loss: float = float("inf")
+
         # Move model to device
         self.model = self.model.to(self.device)
 
@@ -657,6 +660,7 @@ class MDDTrainer:
         self, epoch: int, val_ctc: float, val_det: float
     ) -> None:
         """Persist model weights and metadata to disk."""
+        self.best_val_loss = val_ctc + self.detection_lambda * val_det
         checkpoint: Dict[str, Any] = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
