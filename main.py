@@ -25,16 +25,16 @@ from src.utils.file_utils import load_config
 
 
 # ── Paths (relative to project root) ─────────────────────────────────────────
-# Prefer the synthetic split if it exists (created by scripts/synthesize_errors.py)
-SYNTHETIC_CSV: str = "data/processed/train_split_synthetic.csv"
+# Priority: combined > synthetic > original
+COMBINED_CSV: str = "data/processed/train_split_combined.csv"
 ORIGINAL_TRAIN_CSV: str = "data/processed/train_split.csv"
 VAL_CSV: str = "data/processed/val_split.csv"
 VOCAB_PATH: str = "data/processed/vocab.json"
 CONFIG_PATH: str = "config.yaml"
 
-# Weight multiplier for mispronounced samples — reduced from 5.0 since
-# synthetic data already boosts error representation to ~40%.
-MISPRONUNCIATION_WEIGHT: float = 2.0
+# Weight multiplier for mispronounced samples in WeightedRandomSampler.
+# With synthetic + public data, mispronunciations are ~39% of training.
+MISPRONUNCIATION_WEIGHT: float = 1.5
 
 
 def _compute_sample_weights(csv_path: str) -> Tuple[list, int, int]:
@@ -74,8 +74,8 @@ def _build_loaders(
         ``(train_loader, dev_loader, vocab_size)``.
     """
     # ── Datasets ──────────────────────────────────────────────────────────
-    # Use synthetic split if available, otherwise fall back to original
-    train_csv = SYNTHETIC_CSV if Path(SYNTHETIC_CSV).exists() else ORIGINAL_TRAIN_CSV
+    # Use combined split (train + synthetic + public) if available
+    train_csv = COMBINED_CSV if Path(COMBINED_CSV).exists() else ORIGINAL_TRAIN_CSV
 
     train_dataset = PhonemeDataset(
         split_csv=train_csv,

@@ -71,6 +71,9 @@ class MDDTrainer:
         self.detection_warmup_epochs: int = int(
             train_cfg.get("detection_warmup_epochs", 5)
         )
+        self.unfreeze_fe_epoch: int = int(
+            train_cfg.get("unfreeze_feature_extractor_epoch", 0)
+        )
 
         # ── Optimiser ──────────────────────────────────────────────────────
         decay_params: list[nn.Parameter] = []
@@ -182,6 +185,16 @@ class MDDTrainer:
             ``(avg_ctc_loss, avg_detection_loss)`` over all batches.
         """
         self.model.train()
+
+        # ── Unfreeze Wav2Vec2 feature extractor at the scheduled epoch ──
+        if epoch == self.unfreeze_fe_epoch and self.unfreeze_fe_epoch > 0:
+            for param in self.model.wav2vec2.feature_extractor.parameters():
+                param.requires_grad = True
+            print(
+                f"  ↳ Unfroze Wav2Vec2 feature extractor "
+                f"({sum(p.numel() for p in self.model.wav2vec2.feature_extractor.parameters()):,} params)"
+            )
+
         running_ctc: float = 0.0
         running_det: float = 0.0
 

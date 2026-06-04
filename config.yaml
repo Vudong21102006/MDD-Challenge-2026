@@ -44,6 +44,9 @@ training:
   gate_lambda: 0.01
   # Number of epochs to train with CTC loss only before enabling detection loss.
   detection_warmup_epochs: 5
+  # Epoch at which to unfreeze the Wav2Vec2 CNN feature extractor.
+  # Set to 0 to keep it frozen for all epochs.
+  unfreeze_feature_extractor_epoch: 10
 
 data:
   # Relative paths (from project root).
