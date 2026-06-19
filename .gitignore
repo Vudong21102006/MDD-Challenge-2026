@@ -15,6 +15,7 @@ env/
 
 # Bỏ qua file cấu hình cụ thể
 CLAUDE.MD
+data/MDD-Challenge-2025-public-test
 *.csv
 *.wav
 *.mp3
